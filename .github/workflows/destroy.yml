@@ -1,0 +1,52 @@
+name: Destroy — bazndbl1
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+jobs:
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # `docker_image` has no default in main.tf — destroy still needs it
+          # declared, even though the resource is being torn down. A placeholder
+          # is safe because terraform only resolves it for resources still
+          # in state. Same trick is used by the EKS destroy workflow.
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ] && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
+          terraform destroy -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="docker_image=placeholder:destroy" \
+            -var="registry_server=ghcr.io" \
+            -var="registry_username=destroy" \
+            -var="registry_password=destroy" \
+            "${EXTRA_ARGS[@]}"

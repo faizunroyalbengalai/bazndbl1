@@ -1,0 +1,216 @@
+name: Deploy — bazndbl1
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test --if-present
+
+  # ── Build & push image to GHCR ───────────────────────────────────────────
+  # ACI pulls from GHCR using the same image_registry_credential block as any
+  # other private registry. We default to GHCR (not ACR) to keep the secret
+  # surface small for the user.
+  build_push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set image tag
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PROJECT_LOWER=$(echo "bazndbl1" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER_LOWER}/${PROJECT_LOWER}:${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  # ── Provision ACI via Terraform ─────────────────────────────────────────
+  provision:
+    name: Provision Container Instance
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      fqdn:     ${{ steps.tf_out.outputs.fqdn }}
+      app_port: ${{ steps.tf_out.outputs.app_port }}
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # Build extra-vars defensively — only inject DB knobs when they're set
+          # so a missing DB_USERNAME doesn't clobber the variable default.
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ] && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
+          # GHCR pull credentials — github.actor + GITHUB_TOKEN works for
+          # public-org repos. For private images in a different org you'll
+          # need a PAT in REGISTRY_PASSWORD secret.
+          terraform plan \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="docker_image=${{ needs.build_push.outputs.image }}" \
+            -var="registry_server=ghcr.io" \
+            -var="registry_username=${{ github.actor }}" \
+            -var="registry_password=${{ secrets.GITHUB_TOKEN }}" \
+            "${EXTRA_ARGS[@]}" \
+            -out=tfplan
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Capture Terraform outputs
+        id: tf_out
+        working-directory: terraform
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          PORT=$(terraform output -raw app_port)
+          # `terraform output -raw` exits 1 when the value is null/empty;
+          # use || true so the step doesn't fail — we handle the empty case below.
+          FQDN=$(terraform output -raw fqdn 2>/dev/null || true)
+          PUBLIC_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+
+          # Build the FQDN from first available source:
+          #   1. Terraform fqdn output (populated when dns_name_label is set)
+          #   2. Re-derive it: <dns_label>.<region>.azurecontainer.io
+          #   3. Fall back to raw public IP (health-check still works, no nice name)
+          if [ -z "$FQDN" ]; then
+            # Derive dns_label the same way the Terraform local does, then query
+            # Azure to get the confirmed FQDN (avoids md5 recompute in bash).
+            az login --service-principal \
+              -u "$ARM_CLIENT_ID" \
+              -p "$ARM_CLIENT_SECRET" \
+              --tenant "$ARM_TENANT_ID" > /dev/null
+            az account set --subscription "$ARM_SUBSCRIPTION_ID"
+            RG="${{ secrets.PROJECT_NAME }}-rg"
+            CG="${{ secrets.PROJECT_NAME }}-cg"
+            FQDN=$(az container show -g "$RG" -n "$CG" \
+              --query "ipAddress.fqdn" -o tsv 2>/dev/null || true)
+          fi
+
+          # Last-resort: use the public IP so the verify step isn't polling ""
+          if [ -z "$FQDN" ]; then
+            FQDN="${PUBLIC_IP}"
+          fi
+
+          echo "fqdn=${FQDN}"     >> $GITHUB_OUTPUT
+          echo "app_port=${PORT}" >> $GITHUB_OUTPUT
+          echo "Container FQDN: ${FQDN}:${PORT}"
+
+  # ── Health check ─────────────────────────────────────────────────────────
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - name: Wait for app to be healthy
+        id: hc
+        run: |
+          FQDN="${{ needs.provision.outputs.fqdn }}"
+          PORT="${{ needs.provision.outputs.app_port }}"
+          URL="http://${FQDN}:${PORT}"
+          HEALTH_PATH="/health"
+          echo "Polling ${URL}${HEALTH_PATH}"
+          # ACI cold-start (pulling image + starting container) typically takes
+          # 30-90s. Give the container time before the first probe so we don't
+          # waste retries on connect-refused errors.
+          echo "Waiting 60s for container startup..."
+          sleep 60
+          # 24 retries × 15s = 6 min polling budget; --max-time caps each
+          # request so a stuck connection can't hang the whole job.
+          for i in $(seq 1 24); do
+            if curl -sf --max-time 10 "${URL}${HEALTH_PATH}"; then
+              echo "Health check passed on attempt ${i}/24"
+              exit 0
+            fi
+            echo "Attempt ${i}/24 failed — retrying in 15s"
+            sleep 15
+          done
+          echo "::warning title=Health check failed::${URL}${HEALTH_PATH} did not return 2xx after 24 retries"
+          echo "failed=1" >> $GITHUB_OUTPUT
+      - name: Diagnose container failure
+        if: steps.hc.outputs.failed == '1'
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          # Login via the same service principal Terraform uses, then pull
+          # container state + last 100 log lines so the failure is visible
+          # in this run without needing the user to open the Azure portal.
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" > /dev/null
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+          RG="${{ secrets.PROJECT_NAME }}-rg"
+          CG="${{ secrets.PROJECT_NAME }}-cg"
+          echo "::group::Container group state"
+          az container show -g "$RG" -n "$CG" \
+            --query "{state:instanceView.state, containers:containers[].{name:name, state:instanceView.currentState.state, exit:instanceView.currentState.exitCode, reason:instanceView.currentState.detailStatus}}" \
+            -o table || true
+          echo "::endgroup::"
+          echo "::group::App container logs"
+          az container logs -g "$RG" -n "$CG" --container-name app || true
+          echo "::endgroup::"
+          echo "::group::Recent container events"
+          az container show -g "$RG" -n "$CG" \
+            --query "containers[].instanceView.events[-5:]" -o json || true
+          echo "::endgroup::"
+          exit 1
+
